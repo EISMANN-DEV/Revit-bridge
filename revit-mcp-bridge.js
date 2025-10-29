@@ -153,13 +153,36 @@ app.get('/health', (req, res) => {
   });
 });
 
-// List available tools - DISABLED to prevent n8n from discovering tools directly
-app.get('/tools', (req, res) => {
-  console.log('⚠️  /tools endpoint called - returning disabled message');
-  res.status(404).json({ 
-    error: 'Tool discovery disabled',
-    message: 'n8n should use the "Bridge communication" tool only, not discover tools directly'
-  });
+// List available tools
+app.get('/tools', async (req, res) => {
+  console.log('🔍 /tools endpoint called - fetching tools from MCP server');
+  
+  if (!isInitialized) {
+    console.log('❌ MCP not initialized');
+    return res.status(503).json({ error: 'MCP server not initialized' });
+  }
+
+  const message = {
+    jsonrpc: '2.0',
+    method: 'tools/list',
+    params: {},
+    id: getNextRequestId()
+  };
+
+  try {
+    const response = await sendToMCP(message);
+    console.log('✅ Tools list received:', JSON.stringify(response, null, 2));
+    
+    // Return the tools array from the response
+    if (response.result && response.result.tools) {
+      res.json({ tools: response.result.tools });
+    } else {
+      res.json(response);
+    }
+  } catch (error) {
+    console.log('❌ Error fetching tools:', error.message);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // Call a tool
@@ -231,10 +254,10 @@ app.listen(PORT, () => {
   console.log('  Endpoints:');
   console.log(`    GET  /           - Status`);
   console.log(`    GET  /health     - Health check`);
+  console.log(`    GET  /tools      - List available tools`);
   console.log(`    POST /tools/call - Call a tool`);
   console.log(`    POST /mcp        - Generic MCP request`);
   console.log('');
-  console.log('  ⚠️  /tools endpoint DISABLED to prevent direct tool discovery');
   console.log('═══════════════════════════════════════════════════════════════');
   console.log('');
   
