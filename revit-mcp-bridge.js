@@ -1,233 +1,251 @@
-/**
- * Revit MCP Bridge
- * n8n/LLM  <->  (HTTP)  <->  this bridge  <->  (stdin/stdout)  <->  Revit MCP (node index.js)
- *
- * How to run:
- *   1) Install Node.js (LTS)
- *   2) Open Windows PowerShell in this folder
- *   3) npm install
- *   4) Set REVIT_MCP_PATH below to your built MCP index.js path
- *   5) node bridge.js
- *
- * Endpoints:
- *   GET  /health       - health & status
- *   GET  /tools        - list tools from MCP
- *   POST /tools/call   - call a tool: { "name": "...", "arguments": { ... } }
- *   POST /mcp          - generic JSON-RPC passthrough
- */
-
 const express = require('express');
+const cors = require('cors');
 const { spawn } = require('child_process');
+const bodyParser = require('body-parser');
 
 const app = express();
-app.use(express.json({ limit: '2mb', type: 'application/json', strict: true }));
+app.use(cors());
+app.use(bodyParser.json());
 
-const PORT = process.env.PORT || 3000;
+const PORT = 3000;
+const REVIT_MCP_PATH = 'D:\\Programs\\Revit-mcp\\build\\index.js'; // Adjust this to your path
 
-// >>>> SET THIS TO YOUR MCP BUILD <<<<
-const REVIT_MCP_PATH = process.env.REVIT_MCP_PATH || 'D:\\Programs\\Revit-mcp\\build\\index.js';
-
+// Store the MCP server process
 let mcpProcess = null;
 let isInitialized = false;
 let requestQueue = new Map();
 let requestId = 0;
 
-// Simple in-order queue (Revit is single-threaded)
-let inFlight = Promise.resolve();
-function queueMcp(message, opts) {
-  const job = () => sendToMCP(message, opts);
-  inFlight = inFlight.then(job, job);
-  return inFlight;
-}
-
+// Start the revit-mcp server as a child process
 function startMCPServer() {
-  console.log('Starting Revit MCP server...');
-  mcpProcess = spawn('node', [REVIT_MCP_PATH], { stdio: ['pipe', 'pipe', 'pipe'] });
+  console.log('🚀 Starting revit-mcp server...');
+  console.log('📁 Path:', REVIT_MCP_PATH);
+  
+  mcpProcess = spawn('node', [REVIT_MCP_PATH], {
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
 
+  // Handle stdout from MCP server
   let buffer = '';
   mcpProcess.stdout.on('data', (data) => {
     buffer += data.toString();
+    
+    // Try to parse complete JSON messages
     const lines = buffer.split('\n');
-    buffer = lines.pop(); // hold partial
-    lines.forEach((line) => {
-      if (!line.trim()) return;
-      try {
-        const response = JSON.parse(line);
-        // console.log('<< MCP:', JSON.stringify(response));
-        if (response.id && requestQueue.has(response.id)) {
-          const { resolve } = requestQueue.get(response.id);
-          resolve(response);
-          requestQueue.delete(response.id);
+    buffer = lines.pop(); // Keep incomplete line in buffer
+    
+    lines.forEach(line => {
+      if (line.trim()) {
+        try {
+          const response = JSON.parse(line);
+          console.log('📥 Received from MCP:', JSON.stringify(response, null, 2));
+          
+          // Find and resolve the matching request
+          if (response.id && requestQueue.has(response.id)) {
+            const { resolve } = requestQueue.get(response.id);
+            resolve(response);
+            requestQueue.delete(response.id);
+          }
+        } catch (e) {
+          console.error('❌ Failed to parse MCP response:', line, e);
         }
-      } catch (e) {
-        console.error('Failed to parse MCP response line:', line);
       }
     });
   });
 
   mcpProcess.stderr.on('data', (data) => {
-    console.log('MCP STDERR:', data.toString());
+    console.log('🔧 MCP Server stderr:', data.toString());
   });
 
   mcpProcess.on('close', (code) => {
-    console.log(`MCP exited with code ${code}`);
+    console.log(`⚠️  MCP server process exited with code ${code}`);
     isInitialized = false;
     mcpProcess = null;
-    // Auto-restart after small backoff
-    setTimeout(startMCPServer, 1500);
   });
 
-  // Initialize after small delay (let MCP boot)
-  setTimeout(initializeMCP, 800);
+  // Initialize the MCP connection
+  setTimeout(async () => {
+    await initializeMCP();
+  }, 1000);
 }
 
-function getNextRequestId() {
-  // Keep ids small and positive
-  requestId = (requestId + 1) % 1_000_000;
-  if (requestId === 0) requestId = 1;
-  return requestId;
-}
-
+// Initialize MCP connection
 async function initializeMCP() {
-  if (!mcpProcess) return;
-
+  console.log('🔄 Initializing MCP connection...');
+  
   const initMessage = {
     jsonrpc: '2.0',
     method: 'initialize',
     params: {
       protocolVersion: '2024-11-05',
       capabilities: {},
-      clientInfo: { name: 'n8n-bridge', version: '1.0.0' }
+      clientInfo: {
+        name: 'n8n-bridge',
+        version: '1.0.0'
+      }
     },
     id: getNextRequestId()
   };
 
   try {
-    const response = await sendToMCP(initMessage, { timeoutMs: 20000 });
-    console.log('MCP initialize -> ok');
-    // Notify initialized
-    mcpProcess.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+    const response = await sendToMCP(initMessage);
+    console.log('✅ MCP initialized:', response);
+    
+    // Send initialized notification
+    const notifyMessage = {
+      jsonrpc: '2.0',
+      method: 'notifications/initialized'
+    };
+    mcpProcess.stdin.write(JSON.stringify(notifyMessage) + '\n');
+    
     isInitialized = true;
-  } catch (err) {
-    console.error('Initialize failed:', err.message);
+    console.log('✅ Bridge ready to accept requests');
+    console.log('');
+  } catch (error) {
+    console.error('❌ Failed to initialize MCP:', error);
   }
 }
 
-function sendToMCP(message, { timeoutMs = 120000 } = {}) {
-  return new Promise((resolve, reject) => {
-    if (!mcpProcess) return reject(new Error('MCP server not running'));
+// Get next request ID
+function getNextRequestId() {
+  return ++requestId;
+}
 
-    const id = message.id ?? getNextRequestId();
-    message.id = id;
+// Send message to MCP server and wait for response
+function sendToMCP(message) {
+  return new Promise((resolve, reject) => {
+    if (!mcpProcess) {
+      reject(new Error('MCP server not running'));
+      return;
+    }
 
     const timeout = setTimeout(() => {
-      requestQueue.delete(id);
+      requestQueue.delete(message.id);
       reject(new Error('Request timeout'));
-    }, timeoutMs);
+    }, 30000); // 30 second timeout
 
-    requestQueue.set(id, {
-      resolve: (resp) => {
+    requestQueue.set(message.id, { 
+      resolve: (response) => {
         clearTimeout(timeout);
-        resolve(resp);
+        resolve(response);
       }
     });
 
-    const out = JSON.stringify(message) + '\n';
-    // console.log('>> MCP:', out.trim());
-    mcpProcess.stdin.write(out, 'utf8');
+    const messageStr = JSON.stringify(message) + '\n';
+    console.log('📤 Sending to MCP:', messageStr.trim());
+    mcpProcess.stdin.write(messageStr);
   });
 }
 
-function normalizeMcpResult(response) {
-  if (!response) return { success: false, errorMessage: 'No response', data: null };
-  if (response.error) {
-    return { success: false, errorMessage: response.error.message || 'MCP error', data: null };
-  }
-  const r = response.result;
-  if (!r) return { success: false, errorMessage: 'Empty result', data: null };
+// Health check endpoint
+app.get('/', (req, res) => {
+  res.send(`✅ Revit MCP Bridge running
+MCP Initialized: ${isInitialized}
+MCP Running: ${mcpProcess !== null}
+`);
+});
 
-  // If tool returns content blocks
-  if (Array.isArray(r.content)) {
-    const text = r.content.map(c => c && c.text).filter(Boolean).join('\n');
-    const looksError = /error|failed|exception|编译|类型|命名空间/i.test(text);
-    return { success: !looksError, errorMessage: looksError ? text : null, data: text || r };
-  }
-
-  if (typeof r.success === 'boolean') {
-    return { success: r.success, errorMessage: r.errorMessage || null, data: r.result ?? r.data ?? null };
-  }
-
-  return { success: true, errorMessage: null, data: r };
-}
-
-// --- Routes ---
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', mcpInitialized: isInitialized, mcpRunning: !!mcpProcess });
+  res.json({ 
+    status: 'ok', 
+    mcpInitialized: isInitialized,
+    mcpRunning: mcpProcess !== null 
+  });
 });
 
-app.get('/tools', async (req, res) => {
-  if (!isInitialized) return res.status(503).json({ error: 'MCP not initialized' });
-  try {
-    const response = await queueMcp({ jsonrpc: '2.0', method: 'tools/list' });
-    res.json(response);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+// List available tools - DISABLED to prevent n8n from discovering tools directly
+app.get('/tools', (req, res) => {
+  console.log('⚠️  /tools endpoint called - returning disabled message');
+  res.status(404).json({ 
+    error: 'Tool discovery disabled',
+    message: 'n8n should use the "Bridge communication" tool only, not discover tools directly'
+  });
 });
 
+// Call a tool
 app.post('/tools/call', async (req, res) => {
-  if (!isInitialized) return res.status(503).json({ error: 'MCP not initialized' });
+  console.log('\n╔════════════════════════════════════════════════════════════════╗');
+  console.log('║         NEW /tools/call REQUEST                                ║');
+  console.log('╚════════════════════════════════════════════════════════════════╝');
+  console.log('📥 Request body:', JSON.stringify(req.body, null, 2));
+  
+  if (!isInitialized) {
+    console.log('❌ MCP not initialized');
+    return res.status(503).json({ error: 'MCP server not initialized' });
+  }
 
-  let { name, arguments: args } = req.body || {};
-  if (!name) return res.status(400).json({ success: false, error: 'Tool name is required' });
+  const { name, arguments: args } = req.body;
 
-  if (typeof args === 'string') {
-    try {
-      args = JSON.parse(args);
-    } catch (e) {
-      return res.status(400).json({ success: false, error: 'Arguments must be valid JSON' });
-    }
+  if (!name) {
+    console.log('❌ Missing tool name');
+    return res.status(400).json({ error: 'Tool name is required' });
   }
 
   const message = {
     jsonrpc: '2.0',
     method: 'tools/call',
-    params: { name, arguments: args || {} }
+    params: {
+      name: name,
+      arguments: args || {}
+    },
+    id: getNextRequestId()
   };
 
   try {
-    const response = await queueMcp(message);
-    const norm = normalizeMcpResult(response);
-    res.json({ success: norm.success, result: norm.data, error: norm.errorMessage || null, toolCalled: name });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-app.post('/mcp', async (req, res) => {
-  if (!isInitialized) return res.status(503).json({ error: 'MCP not initialized' });
-  const msg = { ...req.body, id: req.body.id || getNextRequestId() };
-  try {
-    const response = await queueMcp(msg);
+    const response = await sendToMCP(message);
+    console.log('✅ Response:', JSON.stringify(response, null, 2));
     res.json(response);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+  } catch (error) {
+    console.log('❌ Error:', error.message);
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Start server
+// Generic MCP request endpoint
+app.post('/mcp', async (req, res) => {
+  if (!isInitialized) {
+    return res.status(503).json({ error: 'MCP server not initialized' });
+  }
+
+  const message = {
+    ...req.body,
+    id: req.body.id || getNextRequestId()
+  };
+
+  try {
+    const response = await sendToMCP(message);
+    res.json(response);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Start the bridge server
 app.listen(PORT, () => {
-  console.log(`Revit MCP Bridge listening on http://localhost:${PORT}`);
-  console.log(`GET  /health`);
-  console.log(`GET  /tools`);
-  console.log(`POST /tools/call`);
-  console.log(`POST /mcp`);
+  console.log('');
+  console.log('═══════════════════════════════════════════════════════════════');
+  console.log('  🌉 Revit MCP Bridge');
+  console.log('═══════════════════════════════════════════════════════════════');
+  console.log(`  📍 Listening on: http://localhost:${PORT}`);
+  console.log('');
+  console.log('  Endpoints:');
+  console.log(`    GET  /           - Status`);
+  console.log(`    GET  /health     - Health check`);
+  console.log(`    POST /tools/call - Call a tool`);
+  console.log(`    POST /mcp        - Generic MCP request`);
+  console.log('');
+  console.log('  ⚠️  /tools endpoint DISABLED to prevent direct tool discovery');
+  console.log('═══════════════════════════════════════════════════════════════');
+  console.log('');
+  
   startMCPServer();
 });
 
 // Graceful shutdown
 process.on('SIGINT', () => {
-  console.log('Shutting down...');
-  if (mcpProcess) try { mcpProcess.kill(); } catch {}
+  console.log('\n👋 Shutting down...');
+  if (mcpProcess) {
+    mcpProcess.kill();
+  }
   process.exit(0);
 });
